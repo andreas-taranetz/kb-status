@@ -2,12 +2,13 @@
 """
 ZSA Voyager LED status daemon — Oryx protocol, dynamic per-tab column lighting.
 
-Tab allocation: 1 tab = whole keyboard, 2 tabs = halves, 3 = thirds, etc.
+Tab allocation: 1 tab = whole keyboard, 2 tabs = halves, 3 = thirds, 4 = quarters.
+5+ tabs: one column each under number keys 1…N, ~ and right remainder dark.
 Columns re-distribute automatically as tabs register/unregister.
 
 Shell state (preexec/precmd hooks):
-  white fill bottom→top — new terminal joined (~1.5 s join animation)
-  cyan fill bottom→top  — command running (4-step animation, ~1 s cycle)
+  alternating color flash — new terminal joined; all column blocks shown in alternating colors (~1.5 s)
+  cyan fill bottom→top   — command running (4-step animation, ~1 s cycle)
   solid green           — last command exited 0  (clears after 5 s)
   solid red             — last command exited non-zero (clears after 5 s)
 
@@ -43,6 +44,7 @@ FILL_SEQ       = [0, 1, 2, 3]
 # Physical columns left→right, each as [row0(number key), row1, row2, row3(bottom)]
 # Source: keyboards/zsa/voyager/keyboard.json rgb_matrix.layout
 ALL_COLUMNS = [
+    [0,  6,  12, 18],   # under "~"
     [1,  7,  13, 19],   # under "1"
     [2,  8,  14, 20],   # under "2"
     [3,  9,  15, 21],   # under "3"
@@ -53,13 +55,16 @@ ALL_COLUMNS = [
     [28, 34, 40, 46],   # under "8"
     [29, 35, 41, 47],   # under "9"
     [30, 36, 42, 48],   # under "0"
+    [31, 37, 43, 49],   # under "-"
 ]
+
+# Thumb cluster LEDs, left-outer → right-outer = MSB → LSB of the 4-bit tab count.
+THUMB_LEDS = [24, 25, 50, 51]
 
 # Shell states
 S_IDLE = "idle"
 S_BUSY = "busy"
 S_DONE = "done"
-S_JOIN = "join"
 
 # Claude states
 C_NONE  = "none"
@@ -76,19 +81,45 @@ COL_RED    = (220, 0,   0)
 COL_ORANGE = (230, 95,  25)
 COL_BLUE   = (0,   100, 220)
 COL_AMBER  = (255, 160, 0)
+COL_PURPLE  = (80,  0,   160)   # thumb binary counter
+COL_ANNOUNCE_A = (160, 0,  80)   # registration flash — even rank
+COL_ANNOUNCE_B = (0,   80, 160)  # registration flash — odd rank
+
+
+# For 5+ tabs each tab gets one column aligned to its number key; ~ and right remainder stay dark.
+#
+#  cols:  ~  1  2  3  4  5  6  7  8  9  0  -
+#   5  →  ·  1  1  1  1  1  ·  ·  ·  ·  ·  ·
+#   6  →  ·  1  1  1  1  1  1  ·  ·  ·  ·  ·
+#   7  →  ·  1  1  1  1  1  1  1  ·  ·  ·  ·
+#   8  →  ·  1  1  1  1  1  1  1  1  ·  ·  ·
+#   9  →  ·  1  1  1  1  1  1  1  1  1  ·  ·
+#  10  →  ·  1  1  1  1  1  1  1  1  1  1  ·
+_CUSTOM_ALLOCS = {
+    5:  [(1,2),(2,3),(3,4),(4,5),(5,6)],
+    6:  [(1,2),(2,3),(3,4),(4,5),(5,6),(6,7)],
+    7:  [(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8)],
+    8:  [(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9)],
+    9:  [(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9),(9,10)],
+    10: [(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9),(9,10),(10,11)],
+}
 
 
 def _compute_allocations(registered: list) -> dict:
-    """Distribute ALL_COLUMNS evenly across registered tabs (sorted by tab number)."""
+    """Distribute ALL_COLUMNS across registered tabs (sorted by tab number)."""
     n = len(registered)
     if n == 0:
         return {}
     total = len(ALL_COLUMNS)
+    custom = _CUSTOM_ALLOCS.get(n)
     result = {}
     for i, tab in enumerate(sorted(registered)):
-        start = (i * total) // n
-        end   = ((i + 1) * total) // n
-        leds  = []
+        if custom:
+            start, end = custom[i]
+        else:
+            start = (i * total) // n
+            end   = ((i + 1) * total) // n
+        leds = []
         for col_idx in range(start, end):
             leds.extend(ALL_COLUMNS[col_idx])
         result[tab] = leds
@@ -183,10 +214,6 @@ def _led_color(info: dict, frame: int, row: int) -> tuple:
     if info["claude"] == C_WAIT:
         return COL_BLUE
 
-    if info["shell"] == S_JOIN and time.time() < info["shell_until"]:
-        level = FILL_SEQ[frame % len(FILL_SEQ)]
-        return COL_WHITE if row >= (3 - level) else COL_OFF
-
     if info["shell"] == S_BUSY:
         level = FILL_SEQ[frame]
         return COL_CYAN if row >= (3 - level) else COL_OFF
@@ -202,19 +229,20 @@ def _is_active(info: dict) -> bool:
     return (
         info["claude"] in (C_BUSY, C_WAIT, C_ALERT)
         or info["shell"] == S_BUSY
-        or (info["shell"] in (S_JOIN, S_DONE) and now < info["shell_until"])
+        or (info["shell"] == S_DONE and now < info["shell_until"])
     )
 
 
 class LedController:
     def __init__(self, oryx: OryxDevice):
         self._oryx        = oryx
-        self._tabs        = {}   # tab → state dict
-        self._registered  = []  # registered tab numbers
-        self._allocations = {}  # tab → [led_indices]
-        self._lock        = threading.Lock()
-        self._active      = threading.Event()
-        self._shutdown    = threading.Event()
+        self._tabs          = {}   # tab → state dict
+        self._registered    = []  # registered tab numbers
+        self._allocations   = {}  # tab → [led_indices]
+        self._announce_until = 0.0
+        self._lock          = threading.Lock()
+        self._active        = threading.Event()
+        self._shutdown      = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _recompute(self):
@@ -234,19 +262,43 @@ class LedController:
                 still_active = False
 
                 with self._lock:
-                    alloc = dict(self._allocations)
-                    tabs  = dict(self._tabs)
+                    alloc          = dict(self._allocations)
+                    tabs           = dict(self._tabs)
+                    n_tabs         = len(self._registered)
+                    announce_until = self._announce_until
 
-                for tab, leds in alloc.items():
+                announcing = time.time() < announce_until
+                for rank, tab in enumerate(sorted(alloc.keys())):
+                    leds = alloc[tab]
                     info = tabs.get(tab)
                     if info is None:
                         continue
-                    if _is_active(info):
+                    if announcing:
                         still_active = True
-                    for pos, led_idx in enumerate(leds):
-                        row = pos % 4  # 4 LEDs per physical column
-                        color = _led_color(info, frame, row)
-                        updates.append((led_idx, *color))
+                        color = COL_ANNOUNCE_A if rank % 2 == 0 else COL_ANNOUNCE_B
+                        for led_idx in leds:
+                            updates.append((led_idx, *color))
+                    else:
+                        if _is_active(info):
+                            still_active = True
+                        for pos, led_idx in enumerate(leds):
+                            row = pos % 4
+                            color = _led_color(info, frame, row)
+                            updates.append((led_idx, *color))
+
+                # Explicitly blank column LEDs not covered by the current allocation (5+ tab layout)
+                allocated_leds = {led for leds in alloc.values() for led in leds}
+                for col in ALL_COLUMNS:
+                    for led in col:
+                        if led not in allocated_leds:
+                            updates.append((led, *COL_OFF))
+
+                # Thumb cluster: 4-bit binary tab count (MSB left-outer → LSB right-outer)
+                if n_tabs > 0:
+                    still_active = True
+                    for bit, led in enumerate(THUMB_LEDS):
+                        color = COL_PURPLE if (n_tabs >> (3 - bit)) & 1 else COL_OFF
+                        updates.append((led, *color))
 
                 for led, r, g, b in updates:
                     self._oryx.send(ORYX_SET_LED, led, r, g, b)
@@ -266,14 +318,23 @@ class LedController:
 
     # ── registration ──────────────────────────────────────────────────
 
+    def on_announce(self):
+        with self._lock:
+            if not self._registered:
+                return
+            self._announce_until = time.time() + JOIN_TTL
+        self._oryx.send(ORYX_SET_ALL, 0, 0, 0)
+        self._active.set()
+
     def on_register(self, tab: int):
         with self._lock:
             if tab not in self._registered:
+                if len(self._registered) >= 10:
+                    return
                 self._registered.append(tab)
             self._recompute()
-            info = self._get(tab)
-            info["shell"]       = S_JOIN
-            info["shell_until"] = time.time() + JOIN_TTL
+            self._get(tab)
+            self._announce_until = time.time() + JOIN_TTL
         self._active.set()
 
     def on_unregister(self, tab: int):
@@ -283,6 +344,8 @@ class LedController:
                 self._registered.remove(tab)
             self._recompute()
             self._tabs.pop(tab, None)
+            if self._registered:
+                self._announce_until = time.time() + JOIN_TTL
         for led_idx in old_leds:
             self._oryx.send(ORYX_SET_LED, led_idx, 0, 0, 0)
         if self._registered:
@@ -359,7 +422,8 @@ class StatusDaemon:
             cmd = parts[0]
             tab = self._tab(parts[1]) if len(parts) > 1 else 0
 
-            if   cmd == "register":     self._led.on_register(tab)
+            if   cmd == "announce":      self._led.on_announce()
+            elif cmd == "register":     self._led.on_register(tab)
             elif cmd == "unregister":   self._led.on_unregister(tab)
             elif cmd == "busy":         self._led.on_shell_busy(tab)
             elif cmd == "done":         self._led.on_shell_done(tab, int(parts[2]) == 0)

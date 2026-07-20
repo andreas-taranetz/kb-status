@@ -113,10 +113,16 @@ Add to `~/.claude/settings.json`:
 ```json
 "hooks": {
   "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]}],
-  "PreToolUse":       [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]}],
-  "Stop":             [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-wait"}]}],
-  "Notification":     [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-alert"}]}],
-  "SessionEnd":       [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-idle"}]}]
+  "PreToolUse": [
+    {"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]},
+    {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-alert"}]}
+  ],
+  "PostToolUse": [
+    {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]}
+  ],
+  "Stop":        [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-wait"}]}],
+  "Notification":[{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-alert"}]}],
+  "SessionEnd":  [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-idle"}]}]
 }
 ```
 

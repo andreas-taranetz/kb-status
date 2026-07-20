@@ -1,14 +1,15 @@
 # ── Keyboard status (ZSA Voyager LEDs) ──────────────────────────────
 #
-# Distributes keyboard columns across registered terminal tabs:
+# Distributes 12 keyboard columns across registered terminal tabs:
 #   1 tab  → whole keyboard
-#   2 tabs → left half / right half
-#   3 tabs → ~3 columns each, etc.
+#   2 tabs → 6│6  (halves)
+#   3 tabs → 4│4│4, 4 tabs → 3│3│3│3
+#   5+ tabs → one column each under number keys 1…N (max 10; extras dropped)
 #
 # Columns re-distribute automatically as tabs open and close.
 #
 # LED colors:
-#   white fill  — new tab joined (join animation, ~1.5 s)
+#   alternating color flash — new tab joined; all column blocks shown in two alternating colors (~1.5 s)
 #   cyan fill   — command running in that tab
 #   solid green — last command exited 0 (success, clears after 5 s)
 #   solid red   — last command exited non-zero (failure, clears after 5 s)
@@ -102,24 +103,30 @@ kbwhere() {
         kill -0 "$pid" 2>/dev/null && live+=( ${f:t} )
     done
     live=( ${(on)live} )  # sort numerically — must match daemon sort order
-    local n=${#live} total=10
-    local -a cols=(1 2 3 4 5 6 7 8 9 0)
+    local n=${#live} total=12
+    local -a cols=(~ 1 2 3 4 5 6 7 8 9 0 -)
 
     local pos=0
     for (( i=1; i<=n; i++ )); do
         [[ "${live[$i]}" == "$_KB_TAB" ]] && pos=$(( i-1 )) && break
     done
 
-    local start=$(( pos * total / n ))
-    local end=$(( (pos+1) * total / n ))
+    # Must mirror daemon's _CUSTOM_ALLOCS / _compute_allocations logic
+    local start end
+    if (( n >= 5 )); then
+        start=$(( pos + 1 ))
+        end=$(( pos + 2 ))
+    else
+        start=$(( pos * total / n ))
+        end=$(( (pos+1) * total / n ))
+    fi
+
     local width=$(( end - start ))
     local first=${cols[$((start+1))]} last=${cols[$end]}
 
     echo "slot $_KB_TAB · columns $first–$last ($width/$total) · $n tab(s) registered"
 
-    # Flash the columns: busy shows cyan fill, done clears after 2 s
-    printf 'busy %s\n' "$_KB_TAB" | nc -U "$_KB_SOCKET" 2>/dev/null
-    { sleep 2; printf 'done %s 0\n' "$_KB_TAB" | nc -U "$_KB_SOCKET" 2>/dev/null; } &!
+    _kb_send "announce"
 }
 
 # kbreset — clear all LEDs, drop all registrations, restart daemon
