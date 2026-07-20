@@ -40,7 +40,7 @@ Columns re-distribute automatically as tabs open and close.
 |------|---------|
 | `kb-status` | Python daemon — Oryx HID, LED animation loop, Unix socket server |
 | `kb-status.zsh` | Zsh integration — shell hooks, `kbtab`, `kbwhere`, `kbreset` |
-| `kb-claude-busy` | Hook script — sent by Claude Code on `UserPromptSubmit` |
+| `kb-claude-busy` | Hook script — sent by Claude Code on `UserPromptSubmit` and `PreToolUse` |
 | `kb-claude-wait` | Hook script — sent by Claude Code on `Stop` |
 | `kb-claude-alert` | Hook script — sent by Claude Code on `Notification` |
 | `kb-claude-idle` | Hook script — sent by Claude Code on `SessionEnd` |
@@ -113,6 +113,7 @@ Add to `~/.claude/settings.json`:
 ```json
 "hooks": {
   "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]}],
+  "PreToolUse":       [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-busy"}]}],
   "Stop":             [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-wait"}]}],
   "Notification":     [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-alert"}]}],
   "SessionEnd":       [{"hooks": [{"type": "command", "command": "/path/to/kb-status/kb-claude-idle"}]}]
