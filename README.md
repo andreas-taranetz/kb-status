@@ -4,6 +4,8 @@ ZSA Voyager keyboard LED status indicator for macOS terminal tabs.
 
 Lights up columns of your keyboard to reflect what's happening in each terminal tab — commands running, success/failure, and Claude Code state — all without modifying keyboard firmware.
 
+![Demo](demo.gif)
+
 > **Note:** This currently only works with the [ZSA Voyager](https://www.zsa.io/voyager). It communicates over the Oryx HID protocol (USB usage page `0xFF60`) which is specific to ZSA keyboards running their stock firmware.
 
 ## How it works
@@ -12,38 +14,38 @@ A background daemon speaks the Oryx protocol over USB HID to control the RGB mat
 
 The keyboard columns are distributed across registered terminal tabs:
 
-| Tabs open | Layout |
-|-----------|--------|
-| 1 | whole keyboard |
-| 2 | left half / right half |
-| 3 | ~3 columns each |
-| 4 | ~2–3 columns each |
-| … | continues dividing |
+| Tabs open | Layout                 |
+| --------- | ---------------------- |
+| 1         | whole keyboard         |
+| 2         | left half / right half |
+| 3         | ~3 columns each        |
+| 4         | ~2–3 columns each      |
+| …         | continues dividing     |
 
 Columns re-distribute automatically as tabs open and close.
 
 ### LED colors
 
-| Color | Meaning |
-|-------|---------|
-| White fill (bottom→top) | New terminal tab joined |
-| Cyan fill (bottom→top) | Command running |
-| Solid green | Last command exited 0 — clears after 5 s |
-| Solid red | Last command exited non-zero — clears after 5 s |
-| Solid orange | Claude Code is thinking |
-| Solid blue | Claude Code waiting for input |
-| Amber fast blink | Claude Code needs attention |
+| Color                   | Meaning                                         |
+| ----------------------- | ----------------------------------------------- |
+| White fill (bottom→top) | New terminal tab joined                         |
+| Cyan fill (bottom→top)  | Command running                                 |
+| Solid green             | Last command exited 0 — clears after 5 s        |
+| Solid red               | Last command exited non-zero — clears after 5 s |
+| Solid orange            | Claude Code is thinking                         |
+| Solid blue              | Claude Code waiting for input                   |
+| Amber fast blink        | Claude Code needs attention                     |
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `kb-status` | Python daemon — Oryx HID, LED animation loop, Unix socket server |
-| `kb-status.zsh` | Zsh integration — shell hooks, `kbtab`, `kbwhere`, `kbreset` |
-| `kb-claude-busy` | Hook script — sent by Claude Code on `UserPromptSubmit` and `PreToolUse` |
-| `kb-claude-wait` | Hook script — sent by Claude Code on `Stop` |
-| `kb-claude-alert` | Hook script — sent by Claude Code on `Notification` |
-| `kb-claude-idle` | Hook script — sent by Claude Code on `SessionEnd` |
+| File              | Purpose                                                                  |
+| ----------------- | ------------------------------------------------------------------------ |
+| `kb-status`       | Python daemon — Oryx HID, LED animation loop, Unix socket server         |
+| `kb-status.zsh`   | Zsh integration — shell hooks, `kbtab`, `kbwhere`, `kbreset`             |
+| `kb-claude-busy`  | Hook script — sent by Claude Code on `UserPromptSubmit` and `PreToolUse` |
+| `kb-claude-wait`  | Hook script — sent by Claude Code on `Stop`                              |
+| `kb-claude-alert` | Hook script — sent by Claude Code on `Notification`                      |
+| `kb-claude-idle`  | Hook script — sent by Claude Code on `SessionEnd`                        |
 
 ## Requirements
 
@@ -128,11 +130,11 @@ Add to `~/.claude/settings.json`:
 
 ## Shell commands
 
-| Command | Description |
-|---------|-------------|
+| Command     | Description                                                                                                                         |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | `kbtab [N]` | Manually assign this shell to slot N (0–9). Without argument, auto-assigns the next free slot. Runs automatically on shell startup. |
-| `kbwhere` | Print which columns are assigned to this tab and flash them cyan for 2 s. |
-| `kbreset` | Clear all registrations, turn off all LEDs, restart the daemon. |
+| `kbwhere`   | Print which columns are assigned to this tab and flash them cyan for 2 s.                                                           |
+| `kbreset`   | Clear all registrations, turn off all LEDs, restart the daemon.                                                                     |
 
 ## Troubleshooting
 
