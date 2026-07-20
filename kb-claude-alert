@@ -1,0 +1,4 @@
+#!/bin/sh
+if [ -n "$_KB_TAB" ]; then
+    printf 'claude-alert %s\n' "$_KB_TAB" | nc -U "$HOME/.local/run/kb-status.sock" 2>/dev/null
+fi

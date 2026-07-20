@@ -1,0 +1,398 @@
+#!/opt/homebrew/bin/python3
+"""
+ZSA Voyager LED status daemon — Oryx protocol, dynamic per-tab column lighting.
+
+Tab allocation: 1 tab = whole keyboard, 2 tabs = halves, 3 = thirds, etc.
+Columns re-distribute automatically as tabs register/unregister.
+
+Shell state (preexec/precmd hooks):
+  white fill bottom→top — new terminal joined (~1.5 s join animation)
+  cyan fill bottom→top  — command running (4-step animation, ~1 s cycle)
+  solid green           — last command exited 0  (clears after 5 s)
+  solid red             — last command exited non-zero (clears after 5 s)
+
+Claude state (UserPromptSubmit / Stop hooks), higher priority than shell state:
+  solid orange          — Claude is thinking / calling tools
+  solid blue            — Claude finished, waiting for your input
+  amber fast blink      — Claude needs your attention
+
+Protocol reference: github.com/zsa/qmk_modules oryx/oryx.h
+"""
+
+import asyncio
+import hid
+import threading
+import time
+from pathlib import Path
+
+SOCKET_PATH = Path.home() / ".local" / "run" / "kb-status.sock"
+
+KEYBOARD_VID = 0x3297
+KEYBOARD_PID = 0x1977
+
+ORYX_PAIR        = 0x01
+ORYX_RGB_CONTROL = 0x05
+ORYX_SET_LED     = 0x06
+ORYX_SET_ALL     = 0x09
+
+SHELL_DONE_TTL = 5.0
+JOIN_TTL       = 1.5
+TICK           = 0.18
+FILL_SEQ       = [0, 1, 2, 3]
+
+# Physical columns left→right, each as [row0(number key), row1, row2, row3(bottom)]
+# Source: keyboards/zsa/voyager/keyboard.json rgb_matrix.layout
+ALL_COLUMNS = [
+    [1,  7,  13, 19],   # under "1"
+    [2,  8,  14, 20],   # under "2"
+    [3,  9,  15, 21],   # under "3"
+    [4,  10, 16, 22],   # under "4"
+    [5,  11, 17, 23],   # under "5"
+    [26, 32, 38, 44],   # under "6"
+    [27, 33, 39, 45],   # under "7"
+    [28, 34, 40, 46],   # under "8"
+    [29, 35, 41, 47],   # under "9"
+    [30, 36, 42, 48],   # under "0"
+]
+
+# Shell states
+S_IDLE = "idle"
+S_BUSY = "busy"
+S_DONE = "done"
+S_JOIN = "join"
+
+# Claude states
+C_NONE  = "none"
+C_BUSY  = "claude-busy"
+C_WAIT  = "claude-wait"
+C_ALERT = "claude-alert"
+
+# Colors (R, G, B)
+COL_CYAN   = (0,   180, 180)
+COL_WHITE  = (200, 200, 200)
+COL_OFF    = (0,   0,   0)
+COL_GREEN  = (0,   220, 0)
+COL_RED    = (220, 0,   0)
+COL_ORANGE = (230, 95,  25)
+COL_BLUE   = (0,   100, 220)
+COL_AMBER  = (255, 160, 0)
+
+
+def _compute_allocations(registered: list) -> dict:
+    """Distribute ALL_COLUMNS evenly across registered tabs (sorted by tab number)."""
+    n = len(registered)
+    if n == 0:
+        return {}
+    total = len(ALL_COLUMNS)
+    result = {}
+    for i, tab in enumerate(sorted(registered)):
+        start = (i * total) // n
+        end   = ((i + 1) * total) // n
+        leds  = []
+        for col_idx in range(start, end):
+            leds.extend(ALL_COLUMNS[col_idx])
+        result[tab] = leds
+    return result
+
+
+# ── HID device ────────────────────────────────────────────────────────
+
+class OryxDevice:
+    def __init__(self):
+        self._dev  = None
+        self._lock = threading.Lock()
+
+    def _path(self):
+        for d in hid.enumerate(KEYBOARD_VID, KEYBOARD_PID):
+            if d["usage_page"] == 0xFF60:
+                return d["path"]
+        return None
+
+    def connect(self):
+        path = self._path()
+        if not path:
+            return False
+        try:
+            dev = hid.device()
+            dev.open_path(path)
+            dev.set_nonblocking(False)
+            dev.write(bytes([0x00, ORYX_PAIR] + [0] * 30))
+            dev.read(32, timeout_ms=500)
+            dev.set_nonblocking(True)
+            while dev.read(32): pass
+            dev.set_nonblocking(False)
+            self._dev = dev
+            threading.Thread(target=self._drain, daemon=True).start()
+            return True
+        except Exception as e:
+            print(f"[hid] connect failed: {e}", flush=True)
+            return False
+
+    def _drain(self):
+        while self._dev:
+            try:
+                self._dev.set_nonblocking(True)
+                self._dev.read(32)
+                self._dev.set_nonblocking(False)
+                time.sleep(0.05)
+            except Exception:
+                break
+
+    def send(self, *payload):
+        with self._lock:
+            if not self._dev and not self.connect():
+                return
+            try:
+                pkt = bytes([0x00] + list(payload) + [0] * (32 - len(payload)))
+                self._dev.write(pkt)
+            except Exception as e:
+                print(f"[hid] write failed: {e}", flush=True)
+                try: self._dev.close()
+                except Exception: pass
+                self._dev = None
+
+    def close(self):
+        with self._lock:
+            if self._dev:
+                try: self._dev.close()
+                except Exception: pass
+                self._dev = None
+
+
+# ── LED controller ────────────────────────────────────────────────────
+
+def _new_tab():
+    return {
+        "shell":         S_IDLE,
+        "shell_success": True,
+        "shell_until":   0.0,
+        "claude":        C_NONE,
+    }
+
+
+def _led_color(info: dict, frame: int, row: int) -> tuple:
+    """
+    Color for one LED.
+      frame : animation tick index into FILL_SEQ
+      row   : 0 = number key (top), 3 = bottom row
+    """
+    if info["claude"] == C_ALERT:
+        return COL_AMBER if frame % 2 == 0 else COL_OFF
+    if info["claude"] == C_BUSY:
+        return COL_ORANGE
+    if info["claude"] == C_WAIT:
+        return COL_BLUE
+
+    if info["shell"] == S_JOIN and time.time() < info["shell_until"]:
+        level = FILL_SEQ[frame % len(FILL_SEQ)]
+        return COL_WHITE if row >= (3 - level) else COL_OFF
+
+    if info["shell"] == S_BUSY:
+        level = FILL_SEQ[frame]
+        return COL_CYAN if row >= (3 - level) else COL_OFF
+
+    if info["shell"] == S_DONE and time.time() < info["shell_until"]:
+        return COL_GREEN if info["shell_success"] else COL_RED
+
+    return COL_OFF
+
+
+def _is_active(info: dict) -> bool:
+    now = time.time()
+    return (
+        info["claude"] in (C_BUSY, C_WAIT, C_ALERT)
+        or info["shell"] == S_BUSY
+        or (info["shell"] in (S_JOIN, S_DONE) and now < info["shell_until"])
+    )
+
+
+class LedController:
+    def __init__(self, oryx: OryxDevice):
+        self._oryx        = oryx
+        self._tabs        = {}   # tab → state dict
+        self._registered  = []  # registered tab numbers
+        self._allocations = {}  # tab → [led_indices]
+        self._lock        = threading.Lock()
+        self._active      = threading.Event()
+        self._shutdown    = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _recompute(self):
+        """Recompute LED allocations. Must be called with self._lock held."""
+        self._allocations = _compute_allocations(self._registered)
+
+    def _run(self):
+        frame = 0
+        while not self._shutdown.is_set():
+            self._active.wait()
+            self._oryx.send(ORYX_RGB_CONTROL, 0x01)
+            time.sleep(0.2)
+            self._oryx.send(ORYX_SET_ALL, 0, 0, 0)
+
+            while self._active.is_set() and not self._shutdown.is_set():
+                updates = []
+                still_active = False
+
+                with self._lock:
+                    alloc = dict(self._allocations)
+                    tabs  = dict(self._tabs)
+
+                for tab, leds in alloc.items():
+                    info = tabs.get(tab)
+                    if info is None:
+                        continue
+                    if _is_active(info):
+                        still_active = True
+                    for pos, led_idx in enumerate(leds):
+                        row = pos % 4  # 4 LEDs per physical column
+                        color = _led_color(info, frame, row)
+                        updates.append((led_idx, *color))
+
+                for led, r, g, b in updates:
+                    self._oryx.send(ORYX_SET_LED, led, r, g, b)
+
+                if not still_active:
+                    self._active.clear()
+
+                frame = (frame + 1) % len(FILL_SEQ)
+                self._shutdown.wait(TICK)
+
+            self._oryx.send(ORYX_RGB_CONTROL, 0x00)
+
+    def _get(self, tab: int) -> dict:
+        if tab not in self._tabs:
+            self._tabs[tab] = _new_tab()
+        return self._tabs[tab]
+
+    # ── registration ──────────────────────────────────────────────────
+
+    def on_register(self, tab: int):
+        with self._lock:
+            if tab not in self._registered:
+                self._registered.append(tab)
+            self._recompute()
+            info = self._get(tab)
+            info["shell"]       = S_JOIN
+            info["shell_until"] = time.time() + JOIN_TTL
+        self._active.set()
+
+    def on_unregister(self, tab: int):
+        with self._lock:
+            old_leds = list(self._allocations.get(tab, []))
+            if tab in self._registered:
+                self._registered.remove(tab)
+            self._recompute()
+            self._tabs.pop(tab, None)
+        for led_idx in old_leds:
+            self._oryx.send(ORYX_SET_LED, led_idx, 0, 0, 0)
+        if self._registered:
+            self._active.set()
+
+    # ── shell events ──────────────────────────────────────────────────
+
+    def on_shell_busy(self, tab: int):
+        with self._lock:
+            self._get(tab)["shell"] = S_BUSY
+        self._active.set()
+
+    def on_shell_done(self, tab: int, success: bool):
+        with self._lock:
+            info = self._get(tab)
+            info["shell"]         = S_DONE
+            info["shell_success"] = success
+            info["shell_until"]   = time.time() + SHELL_DONE_TTL
+        self._active.set()
+
+    # ── claude events ─────────────────────────────────────────────────
+
+    def on_claude_busy(self, tab: int):
+        with self._lock:
+            self._get(tab)["claude"] = C_BUSY
+        self._active.set()
+
+    def on_claude_wait(self, tab: int):
+        with self._lock:
+            self._get(tab)["claude"] = C_WAIT
+        self._active.set()
+
+    def on_claude_alert(self, tab: int):
+        with self._lock:
+            self._get(tab)["claude"] = C_ALERT
+        self._active.set()
+
+    def on_claude_idle(self, tab: int):
+        with self._lock:
+            self._get(tab)["claude"] = C_NONE
+
+    def all_off(self):
+        with self._lock:
+            self._tabs.clear()
+            self._registered.clear()
+            self._allocations.clear()
+        self._active.clear()
+        self._oryx.send(ORYX_RGB_CONTROL, 0x01)
+        time.sleep(0.05)
+        self._oryx.send(ORYX_SET_ALL, 0, 0, 0)
+        time.sleep(0.05)
+        self._oryx.send(ORYX_RGB_CONTROL, 0x00)
+
+    def shutdown(self):
+        self._shutdown.set()
+        self._active.set()
+
+
+# ── Socket server ─────────────────────────────────────────────────────
+
+class StatusDaemon:
+    def __init__(self):
+        self._oryx = OryxDevice()
+        self._led  = LedController(self._oryx)
+
+    def _tab(self, s: str) -> int:
+        return int(s) if s.isdigit() else 0
+
+    async def _handle(self, reader, writer):
+        try:
+            parts = (await reader.readline()).decode().split(maxsplit=2)
+            if not parts:
+                return
+            cmd = parts[0]
+            tab = self._tab(parts[1]) if len(parts) > 1 else 0
+
+            if   cmd == "register":     self._led.on_register(tab)
+            elif cmd == "unregister":   self._led.on_unregister(tab)
+            elif cmd == "busy":         self._led.on_shell_busy(tab)
+            elif cmd == "done":         self._led.on_shell_done(tab, int(parts[2]) == 0)
+            elif cmd == "claude-busy":  self._led.on_claude_busy(tab)
+            elif cmd == "claude-wait":  self._led.on_claude_wait(tab)
+            elif cmd == "claude-alert": self._led.on_claude_alert(tab)
+            elif cmd == "claude-idle":  self._led.on_claude_idle(tab)
+            elif cmd == "reset":        self._led.all_off()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    async def serve(self):
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SOCKET_PATH.unlink(missing_ok=True)
+        server = await asyncio.start_unix_server(self._handle, path=str(SOCKET_PATH))
+        SOCKET_PATH.chmod(0o600)
+        print(f"kb-status: listening on {SOCKET_PATH}", flush=True)
+        async with server:
+            await server.serve_forever()
+
+
+if __name__ == "__main__":
+    import signal
+    daemon = StatusDaemon()
+
+    def _shutdown(sig, frame):
+        daemon._led.shutdown()
+        daemon._oryx.close()
+        SOCKET_PATH.unlink(missing_ok=True)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+    asyncio.run(daemon.serve())
