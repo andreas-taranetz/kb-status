@@ -71,12 +71,19 @@ _kb_preexec() {
     # Skip shell-busy signal for commands that manage their own LED state
     case "$cmd" in
         claude|cr|c|kbtab|exit|q) _kb_skip_precmd=1; return ;;
+        tmux)
+            # Hand off slot to the tmux pane; reclaim it when tmux exits
+            [[ -S "$_KB_SOCKET" ]] && printf 'unregister %s\n' "$_KB_TAB" | nc -U "$_KB_SOCKET" 2>/dev/null
+            rm -f "$_KB_TAB_DIR/$_KB_TAB"
+            _kb_skip_precmd=2
+            return ;;
     esac
     _kb_skip_precmd=0
     [[ -n "$_KB_TAB" ]] && _kb_send "busy $_KB_TAB"
 }
 _kb_precmd() {
     local rc=$?
+    if (( _kb_skip_precmd == 2 )); then kbtab "$_KB_TAB"; return; fi
     if (( _kb_skip_precmd )); then _kb_skip_precmd=0; return; fi
     [[ -n "$_KB_TAB" ]] && _kb_send "done $_KB_TAB $rc"
 }
@@ -126,7 +133,7 @@ kbwhere() {
 
     echo "slot $_KB_TAB · columns $first–$last ($width/$total) · $n tab(s) registered"
 
-    _kb_send "announce"
+    _kb_send "where $_KB_TAB"
 }
 
 # kbreset — clear all LEDs, drop all registrations, restart daemon

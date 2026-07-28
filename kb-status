@@ -38,6 +38,7 @@ ORYX_SET_ALL     = 0x09
 
 SHELL_DONE_TTL = 5.0
 JOIN_TTL       = 1.5
+WHERE_TTL      = 1.5
 TICK           = 0.18
 FILL_SEQ       = [0, 1, 2, 3]
 
@@ -84,6 +85,7 @@ COL_AMBER  = (255, 160, 0)
 COL_PURPLE  = (80,  0,   160)   # thumb binary counter
 COL_ANNOUNCE_A = (160, 0,  80)   # registration flash — even rank
 COL_ANNOUNCE_B = (0,   80, 160)  # registration flash — odd rank
+COL_WHERE      = (255, 255, 255) # kbwhere self-flash
 
 
 # For 5+ tabs each tab gets one column aligned to its number key; ~ and right remainder stay dark.
@@ -198,6 +200,7 @@ def _new_tab():
         "shell_success": True,
         "shell_until":   0.0,
         "claude":        C_NONE,
+        "where_until":   0.0,
     }
 
 
@@ -207,6 +210,9 @@ def _led_color(info: dict, frame: int, row: int) -> tuple:
       frame : animation tick index into FILL_SEQ
       row   : 0 = number key (top), 3 = bottom row
     """
+    if time.time() < info["where_until"]:
+        return COL_WHERE if frame % 2 == 0 else COL_OFF
+
     if info["claude"] == C_ALERT:
         return COL_AMBER if frame % 2 == 0 else COL_OFF
     if info["claude"] == C_BUSY:
@@ -227,7 +233,8 @@ def _led_color(info: dict, frame: int, row: int) -> tuple:
 def _is_active(info: dict) -> bool:
     now = time.time()
     return (
-        info["claude"] in (C_BUSY, C_WAIT, C_ALERT)
+        now < info["where_until"]
+        or info["claude"] in (C_BUSY, C_WAIT, C_ALERT)
         or info["shell"] == S_BUSY
         or (info["shell"] == S_DONE and now < info["shell_until"])
     )
@@ -387,6 +394,11 @@ class LedController:
         with self._lock:
             self._get(tab)["claude"] = C_NONE
 
+    def on_where(self, tab: int):
+        with self._lock:
+            self._get(tab)["where_until"] = time.time() + WHERE_TTL
+        self._active.set()
+
     def all_off(self):
         with self._lock:
             self._tabs.clear()
@@ -431,6 +443,7 @@ class StatusDaemon:
             elif cmd == "claude-wait":  self._led.on_claude_wait(tab)
             elif cmd == "claude-alert": self._led.on_claude_alert(tab)
             elif cmd == "claude-idle":  self._led.on_claude_idle(tab)
+            elif cmd == "where":        self._led.on_where(tab)
             elif cmd == "reset":        self._led.all_off()
         except Exception:
             pass
