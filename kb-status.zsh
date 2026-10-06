@@ -37,14 +37,15 @@ _kb_send() { [[ -S "$_KB_SOCKET" ]] && printf '%s\n' "$*" | nc -U "$_KB_SOCKET" 
 
 # kbtab [N] — assign this shell to keyboard slot N (0-9), or auto-assign if omitted
 kbtab() {
-    local n=$1
+    # Declared once up front: re-running a bare `local pid` in the loop makes zsh print "pid=<value>"
+    local n=$1 pid pidfile
     mkdir -p "$_KB_TAB_DIR"
     if [[ -z "$n" ]]; then
         # Auto-assign: pick lowest slot whose PID file is absent or stale
         for n in 1 2 3 4 5 6 7 8 9 0; do
-            local pidfile="$_KB_TAB_DIR/$n"
+            pidfile="$_KB_TAB_DIR/$n"
             if [[ -f "$pidfile" ]]; then
-                local pid=$(cat "$pidfile" 2>/dev/null)
+                IFS= read -r pid < "$pidfile" 2>/dev/null || pid=""
                 kill -0 "$pid" 2>/dev/null && continue   # slot live, skip
                 rm -f "$pidfile"                          # stale, reclaim
             fi
